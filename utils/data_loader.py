@@ -745,13 +745,13 @@ class MemoryDataset(Dataset):
     def add_new_class(self, cls_list, sample=None):
         self.cls_list = cls_list
         self.cls_count.append(0)
-        self.cls_loss.append(None)
-        if sample is not None:
-            self.cls_times.append(sample['time'])
-        else:
-            self.cls_times.append(None)
+        # self.cls_loss.append(None)
+        # if sample is not None:
+            # self.cls_times.append(sample['time'])
+        # else:
+            # self.cls_times.append(None)
         #self.cls_used_times.append(max(self.cls_times))
-        self.cls_weight.append(1)
+        # self.cls_weight.append(1)
         self.cls_idx.append([])
         self.class_usage_cnt.append(0)
         self.cls_dict = {self.cls_list[i]:i for i in range(len(self.cls_list))}
@@ -868,7 +868,7 @@ class MemoryDataset(Dataset):
         data = []
         if stream_batch_size > 0:
             for i in stream_indices:
-                data.append(self.transforms(self.stream_data[i]))
+                data.append(self.transforms(copy.deepcopy(self.stream_data[i])))
 
         if memory_batch_size > 0:
             for i in indices:

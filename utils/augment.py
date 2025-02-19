@@ -543,3 +543,7 @@ def get_pretrained_statistics(dataset: str):
         return 'datasets/VOC_10/images', 'datasets/VOC_10/labels'
     else:
         raise ValueError("Wrong dataset name")
+    
+def get_exposed_classes(dataset: str):
+    if dataset == 'VOC_10_10':
+        return ['aeroplane', 'bicycle', 'bird', 'boat', 'bottle', 'bus', 'car', 'cat', 'chair', 'cow']

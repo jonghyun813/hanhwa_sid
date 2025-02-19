@@ -18,10 +18,11 @@ from flops_counter.ptflops import get_model_complexity_info
 # from utils.cka import linear_CKA
 from utils.data_loader import ImageDataset, StreamDataset, MemoryDataset, cutmix_data, get_statistics
 from utils.train_utils import select_model, select_optimizer, select_scheduler
-
+from utils.augment import get_exposed_classes
 #### object detection
 from ultralytics import YOLO
 from ultralytics.cfg import get_cfg
+import random
 
 logger = logging.getLogger()
 
@@ -36,12 +37,9 @@ def cycle(iterable):
 
 class ER:
     def __init__(
-            self, criterion, device, n_classes, **kwargs
+            self, criterion, n_classes, device, **kwargs
     ):
-        self.num_learned_class = 0
-        self.num_learning_class = 1
         self.n_classes = n_classes
-        self.exposed_classes = []
         self.seen = 0
         self.topk = kwargs["topk"]
         self.class_std_list = []
@@ -82,16 +80,23 @@ class ER:
         if self.use_amp:
             self.scaler = torch.cuda.amp.GradScaler()
 
-        self.model = YOLO('yolov8s.pt')
+        self.exposed_classes = get_exposed_classes(self.dataset)
+        self.num_learned_class = len(self.exposed_classes)
+        self.num_learning_class = len(self.exposed_classes)+1
+        
+        self.model = select_model(self.dataset)
+        self.model = self.model.to(device)
         print("model")
         print(self.model)
         self.args = get_cfg(overrides=self.model.ckpt['train_args'])
+        self.model.model.args = self.args
+        
+        self.stride = max(int(self.model.model.stride.max() if hasattr(self.model.model, "stride") else 32), 32) 
         
         self.optimizer = select_optimizer(self.opt_name, self.model, self.lr)
         
         self.scheduler = None #select_scheduler(self.sched_name, self.optimizer, self.lr_gamma)
 
-        self.criterion = criterion.to(self.device)
         self.memory = MemoryDataset(self.args, self.dataset, self.exposed_classes, data_dir=self.data_dir, device=self.device, memory_size=self.memory_size)
         self.temp_batch = []
         self.num_updates = 0
@@ -134,9 +139,9 @@ class ER:
         if len(self.temp_batch) == self.temp_batchsize:
             iteration = int(self.num_updates)
             if iteration != 0:
-                train_loss, train_acc = self.online_train(self.temp_batch, self.batch_size, n_worker,
+                train_loss = self.online_train(self.temp_batch, self.batch_size, n_worker,
                                                       iterations=int(self.num_updates), stream_batch_size=self.temp_batchsize)
-                self.report_training(sample_num, train_loss, train_acc)
+                self.report_training(sample_num, train_loss)
                 
                 for stored_sample in self.temp_batch:
                     self.update_memory(stored_sample)
@@ -178,31 +183,22 @@ class ER:
         #         del self.optimizer.state[param]
         # del self.optimizer.param_groups[1]
         # self.optimizer.add_param_group({'params': self.model.fc.parameters()})
-        # self.memory.add_new_class(cls_list=self.exposed_classes)
+        self.memory.add_new_class(cls_list=self.exposed_classes)
         # if 'reset' in self.sched_name:
         #     self.update_schedule(reset=True)
 
     def online_train(self, sample, batch_size, n_worker, iterations=1, stream_batch_size=1):
-        total_loss, correct, num_data = 0.0, 0.0, 0.0
+        total_loss = 0.0
         if len(sample) > 0:
             self.memory.register_stream(sample)
-
         for i in range(iterations):
             self.model.model.train()
             data = self.memory.get_batch(batch_size, stream_batch_size)
             
-            breakpoint()
-
-            # std check 위해서
-            class_std, sample_std = self.memory.get_std()
-            self.class_std_list.append(class_std)
-            self.sample_std_list.append(sample_std)
-
             self.optimizer.zero_grad()
+            self.model.model.train()
 
-            logit, loss = self.model_forward(x,y)
-
-            _, preds = logit.topk(self.topk, 1, True, True)
+            loss, loss_item = self.model_forward(data)
 
             if self.use_amp:
                 self.scaler.scale(loss).backward()
@@ -215,65 +211,45 @@ class ER:
             self.update_schedule()
 
             total_loss += loss.item()
-            correct += torch.sum(preds == y.unsqueeze(1)).item()
-            num_data += y.size(0)
-            self.total_flops += (batch_size * (self.forward_flops + self.backward_flops))
-            print("self.total_flops", self.total_flops)
+            
+            # self.total_flops += (batch_size * (self.forward_flops + self.backward_flops))
+            # print("self.total_flops", self.total_flops)
 
-        return total_loss / iterations, correct / num_data
+        return total_loss / iterations
 
-    '''
-    def model_forward(self, x, y):
-        do_cutmix = self.cutmix and np.random.rand(1) < 0.5
-        if do_cutmix:
-            x, labels_a, labels_b, lam = cutmix_data(x=x, y=y, alpha=1.0)
-            if self.use_amp:
-                with torch.cuda.amp.autocast():
-                    logit = self.model(x)
-                    loss = lam * self.criterion(logit, labels_a) + (1 - lam) * self.criterion(logit, labels_b)
-            else:
-                logit = self.model(x)
-                loss = lam * self.criterion(logit, labels_a) + (1 - lam) * self.criterion(logit, labels_b)
+    
+    def model_forward(self, batch):
+        if self.use_amp:
+            with torch.cuda.amp.autocast():
+                batch = self.preprocess_batch(batch)
+                loss, loss_items = self.model.model(batch)
         else:
-            if self.use_amp:
-                with torch.cuda.amp.autocast():
-                    logit = self.model(x)
-                    loss = self.criterion(logit, y)
-            else:
-                logit = self.model(x)
-                loss = self.criterion(logit, y)
-        return logit, loss
-    '''
+            batch = self.preprocess_batch(batch)
+            loss, loss_items = self.model.model(batch)
+        
+        return loss, loss_items
+    
+    def preprocess_batch(self, batch):
+        """Preprocesses a batch of images by scaling and converting to float."""
+        batch["img"] = batch["img"].to(self.device, non_blocking=True).float() / 255
+        if self.args.multi_scale:
+            imgs = batch["img"]
+            sz = (
+                random.randrange(int(self.args.imgsz * 0.5), int(self.args.imgsz * 1.5 + self.stride))
+                // self.stride
+                * self.stride
+            )  # size
+            sf = sz / max(imgs.shape[2:])  # scale factor
+            if sf != 1:
+                ns = [
+                    math.ceil(x * sf / self.stride) * self.stride for x in imgs.shape[2:]
+                ]  # new shape (stretched to gs-multiple)
+                imgs = nn.functional.interpolate(imgs, size=ns, mode="bilinear", align_corners=False)
+            batch["img"] = imgs
+        return batch
 
-    def model_forward(self, x, y):
-        do_cutmix = self.cutmix and np.random.rand(1) < 0.5
-        if do_cutmix:
-            x, labels_a, labels_b, lam = cutmix_data(x=x, y=y, alpha=1.0)
-            if self.use_amp:
-                with torch.cuda.amp.autocast():
-                    logit, features = self.model(x, get_features=True)
-                    loss = lam * self.criterion(logit, labels_a) + (1 - lam) * self.criterion(logit, labels_b)
-                    self.total_flops += (len(logit) * 4) / 10e9
-            else:
-                logit, features = self.model(x, get_features=True)
-                loss = lam * self.criterion(logit, labels_a) + (1 - lam) * self.criterion(logit, labels_b)
-                self.total_flops += (len(logit) * 4) / 10e9
-        else:
-            if self.use_amp:
-                with torch.cuda.amp.autocast():
-                    logit, features = self.model(x, get_features=True)
-                    loss = self.criterion(logit, y)
-                    self.total_flops += (len(logit) * 2) / 10e9
-            else:
-                logit, features = self.model(x, get_features=True)
-                loss = self.criterion(logit, y)
-                self.total_flops += (len(logit) * 2) / 10e9
-
-        return logit, loss
-
-    def report_training(self, sample_num, train_loss, train_acc, train_initial_cka=None, train_group1_cka=None, train_group2_cka=None, train_group3_cka=None, train_group4_cka=None):
+    def report_training(self, sample_num, train_loss, train_initial_cka=None, train_group1_cka=None, train_group2_cka=None, train_group3_cka=None, train_group4_cka=None):
         self.writer.add_scalar(f"train/loss", train_loss, sample_num)
-        self.writer.add_scalar(f"train/acc", train_acc, sample_num)
 
         if train_initial_cka is not None:
             '''
@@ -294,7 +270,7 @@ class ER:
             #self.writer.add_scalar(f"train/fc_cka", train_fc_cka, sample_num)
 
         logger.info(
-            f"Train | Sample # {sample_num} | train_loss {train_loss:.4f} | train_acc {train_acc:.4f} | "
+            f"Train | Sample # {sample_num} | train_loss {train_loss:.4f} | "
             f"lr {self.optimizer.param_groups[0]['lr']:.6f} | "
             f"running_time {datetime.timedelta(seconds=int(time.time() - self.start_time))} | "
             f"ETA {datetime.timedelta(seconds=int((time.time() - self.start_time) * (self.total_samples-sample_num) / sample_num))}"
@@ -350,7 +326,7 @@ class ER:
         pass
 
     def online_evaluate(self, sample_num, cls_dict, cls_addition, data_time):
-        results = self.model.val(data="VOC.yaml")
+        results = self.model.val(data="configuration/datasets/VOC.yaml")
         # self.exposed_classes
         breakpoint()
         # online_acc = self.calculate_online_acc(eval_dict["cls_acc"], data_time, cls_dict, cls_addition)
@@ -428,7 +404,7 @@ class ER:
 
     def reservoir_memory(self, sample):
         self.seen += 1
-        if len(self.memory.images) >= self.memory_size:
+        if len(self.memory.labels) >= self.memory_size:
             j = np.random.randint(0, self.seen)
             if j < self.memory_size:
                 self.memory.replace_sample(sample, j, mode=self.mode, online_iter=self.online_iter)
