@@ -64,7 +64,7 @@ def main():
     else:
         criterion = nn.CrossEntropyLoss(reduction="mean")
     method = select_method(
-        args, criterion, device, n_classes
+        args, criterion, n_classes, device
     )
     
     # print()
