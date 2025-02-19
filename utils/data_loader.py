@@ -16,12 +16,12 @@ from torch.utils.data import Dataset
 import torch.nn as nn
 from kornia import image_to_tensor, tensor_to_image
 from kornia.geometry.transform import resize
-from utils.augmentations import CustomRandomCrop, CustomRandomHorizontalFlip, DoubleCompose, DoubleTransform
 import torch.multiprocessing as multiprocessing
 
-from utils.augment import DataAugmentation, Preprocess, get_statistics
+from utils.augment import DataAugmentation, Preprocess, get_statistics, get_pretrained_statistics
 
 from utils.data_worker import worker_loop
+import glob
 
 logger = logging.getLogger()
 
@@ -248,19 +248,6 @@ class XDERLoader(MultiProcessLoader):
 def nonzero_indices(bool_mask_tensor):
     # Returns tensor which contains indices of nonzero elements in bool_mask_tensor
     return bool_mask_tensor.nonzero(as_tuple=True)[0]
-
-def get_custom_double_transform(self, transform):
-    tfs = []
-    for tf in transform:
-        if isinstance(tf, transforms.RandomCrop):
-            tfs.append(CustomRandomCrop(tf.size, tf.padding, resize=self.args.resize_maps==1, min_resize_index=2))
-        elif isinstance(tf, transforms.RandomHorizontalFlip):
-            tfs.append(CustomRandomHorizontalFlip(tf.p))
-        elif isinstance(tf, transforms.Compose):
-            tfs.append(DoubleCompose(
-                get_custom_double_transform(tf.transforms)))
-        else:
-            tfs.append(DoubleTransform(tf))
 
 def partial_distill_loss(model, net_partial_features: list, pret_partial_features: list,
                          targets, device, teacher_forcing: list = None, extern_attention_maps: list = None):
@@ -523,41 +510,57 @@ class StreamDataset(Dataset):
         return data
 
 
+from ultralytics.data.augment import (
+    Compose,
+    Format,
+    LetterBox,
+    v8_transforms,
+    Instances
+)
+from ultralytics.utils.ops import resample_segments
+import cv2
+
+from types import SimpleNamespace
+
+def collate_fn(batch):
+    """Collates data samples into batches."""
+    new_batch = {}
+    keys = batch[0].keys()
+    values = list(zip(*[list(b.values()) for b in batch]))
+    for i, k in enumerate(keys):
+        value = values[i]
+        if k == "img":
+            value = torch.stack(value, 0)
+        if k in {"masks", "keypoints", "bboxes", "cls", "segments", "obb"}:
+            value = torch.cat(value, 0)
+        new_batch[k] = value
+    new_batch["batch_idx"] = list(new_batch["batch_idx"])
+    for i in range(len(new_batch["batch_idx"])):
+        new_batch["batch_idx"][i] += i  # add target image index for build_targets()
+    new_batch["batch_idx"] = torch.cat(new_batch["batch_idx"], 0)
+    return new_batch
 
 class MemoryDataset(Dataset):
-    def __init__(self, dataset, transform=None, cls_list=None, device=None, test_transform=None,
-                 data_dir=None, transform_on_gpu=True, save_test=None, keep_history=False, use_kornia=True, 
-                 buf_transform=None, cls_weight_decay=None, weight_option=None, weight_ema_ratio=None, 
-                 use_human_training=False, klass_warmup = None, klass_train_warmup=None, temperature=None):
+    def __init__(self, args, dataset, cls_list=None, device=None, data_dir=None, memory_size=None):
+        self.args = args
         
-        self.klass_train_warmup = klass_train_warmup
-        self.use_human_training = use_human_training
-        self.use_kornia = use_kornia
-        self.datalist = []
-        self.cls_magnitude = None
-        self.weight_ema_ratio = weight_ema_ratio
-        self.losses = []
+        self.memory_size=memory_size
+        self.buffer = []
+        self.ims = []
+        self.im_hw0 = [] 
+        self.im_hw = []
         self.labels = []
-        self.cls_weight_decay = cls_weight_decay
-        self.weight_option = weight_option
-        self.images = []
-        self.cls_loss = []
-        self.cls_times = []
-        self.stream_images = []
+        
+        self.stream_data = []
         self.logits = []
-        self.attention_maps = []
-        self.cls_weight = []
-        self.klass_warmup = klass_warmup
-        self.stream_labels = []
+        
         self.dataset = dataset
-        self.transform = transform
         self.counts = []
         self.class_usage_cnt = []
         self.tasks = []
-        self.T = temperature
         self.cls_list = []
         self.cls_used_times = []
-        self.cls_dict = {cls_list[i]:i for i in range(len(cls_list))}
+        self.cls_dict = {}#{cls_list[i]:i for i in range(len(cls_list))}
         self.cls_count = []
         self.cls_idx = []
         self.cls_train_cnt = np.array([])
@@ -565,34 +568,180 @@ class MemoryDataset(Dataset):
         self.others_loss_decrease = np.array([])
         self.previous_idx = np.array([], dtype=int)
         self.device = device
-        self.test_transform = test_transform
         self.data_dir = data_dir
-        self.keep_history = keep_history
         self.usage_cnt = []
         self.sample_weight = []
-        #self.buf_transform = get_custom_double_transform(buf_transform)
-        self.transform_on_gpu = transform_on_gpu
+        self.data = {}
         
-        mean, std, n_classes, inp_size, _ = get_statistics(dataset=self.dataset)
+        n_classes, image_dir, label_dir = get_statistics(dataset=self.dataset)
+        
+        self.image_dir = image_dir
+        self.label_dir = label_dir
+        
+        self.augment = True
+        self.rect = False
+        self.imgsz = self.args.imgsz
+        self.use_segments = False
+        self.use_keypoints = False
+        self.use_obb = False
+        
+        self.build_initial_buffer()
+        
+        self.transforms = self.build_transforms(self.args)
+        
+    def build_initial_buffer(self):
+        images_dir, labels_dir = get_pretrained_statistics(self.dataset)
+        label_files = glob.glob(os.path.join(labels_dir, f"*/*.txt"))
+        indices = np.random.choice(range(len(label_files)), size=self.memory_size, replace=False)
+        
+        for idx in indices:
+            sample = label_files[idx]
+            split_name = sample.split('/')[-2]
+            base_name = sample.split('/')[-1][:-4]
+            self.replace_sample({'file_name':split_name + '/' + base_name, 'label':None},images_dir=images_dir, labels_dir=labels_dir)
 
-        self.preprocess = Preprocess(input_size=inp_size)
-        if self.transform_on_gpu:
-            self.transform_cpu = transforms.Compose(
-            [
-                transforms.Resize((inp_size, inp_size)),
-                transforms.PILToTensor()
-            ])
-            self.transform_gpu = transform
-            self.test_transform = transforms.Compose([transforms.ConvertImageDtype(torch.float32),
-            transforms.Normalize(mean, std)])
-        self.save_test = save_test
-        if self.save_test is not None:
-            self.device_img = []
-
-
-    def __len__(self):
-        return len(self.images)
+    def build_transforms(self, hyp=None):
+        """Builds and appends transforms to the list."""
+        if self.augment:
+            hyp.mosaic = hyp.mosaic if self.augment and not self.rect else 0.0
+            hyp.mixup = hyp.mixup if self.augment and not self.rect else 0.0
+            transforms = v8_transforms(self, self.imgsz, hyp)
+        else:
+            transforms = Compose([LetterBox(new_shape=(self.imgsz, self.imgsz), scaleup=False)])
+        transforms.append(
+            Format(
+                bbox_format="xywh",
+                normalize=True,
+                return_mask=self.use_segments,
+                return_keypoint=self.use_keypoints,
+                return_obb=self.use_obb,
+                batch_idx=True,
+                mask_ratio=hyp.mask_ratio,
+                mask_overlap=hyp.overlap_mask,
+                bgr=hyp.bgr if self.augment else 0.0,  # only affect training.
+            )
+        )
+        return transforms
     
+    def __len__(self):
+        return len(self.labels)
+    
+    def __getitem__(self, idx):
+        return self.transforms(self.get_image_and_label(idx))
+
+    def get_image_and_label(self, index):
+        label = copy.deepcopy(self.labels[index])
+        label.pop("shape", None)  # shape is for rect, remove it
+        label["img"], label["ori_shape"], label["resized_shape"] = self.ims[index], self.im_hw0[index], self.im_hw[index]
+        label["ratio_pad"] = (
+            label["resized_shape"][0] / label["ori_shape"][0],
+            label["resized_shape"][1] / label["ori_shape"][1],
+        )  # for evaluation
+        return self.update_labels_info(label)
+    
+    def get_data(self, img_name, cls_label=None, image_dir = None, label_dir = None):
+        img_path = os.path.join(image_dir, img_name+'.jpg')
+        im = cv2.imread(img_path)  # BGR
+        h0, w0 = im.shape[:2]  # orig hw
+        r = self.imgsz / max(h0, w0)  # ratio
+        if r != 1:  # if sizes are not equal
+            w, h = (min(math.ceil(w0 * r), self.imgsz), min(math.ceil(h0 * r), self.imgsz))
+            im = cv2.resize(im, (w, h), interpolation=cv2.INTER_LINEAR)
+        
+        lb_file = os.path.join(label_dir, img_name+'.txt')
+        if os.path.isfile(lb_file):
+            nf = 1  # label found
+            with open(lb_file) as f:
+                lb = [x.split() for x in f.read().strip().splitlines() if len(x)]
+                lb = np.array(lb, dtype=np.float32)
+            if nl := len(lb):
+                assert lb.shape[1] == 5, f"labels require 5 columns, {lb.shape[1]} columns detected"
+                points = lb[:, 1:]
+                assert points.max() <= 1, f"non-normalized or out of bounds coordinates {points[points > 1]}"
+                assert lb.min() >= 0, f"negative label values {lb[lb < 0]}"
+
+                # All labels
+                max_cls = lb[:, 0].max()  # max label count
+                
+                _, i = np.unique(lb, axis=0, return_index=True)
+                if len(i) < nl:  # duplicate row check
+                    lb = lb[i]  # remove duplicates
+                    
+                if cls_label is not None:
+                    new_lb = []
+                    if isinstance(cls_label, int):
+                        for i in range(len(lb)):
+                            if lb[i][0] == cls_label:
+                                new_lb.append(lb[i])
+                    elif isinstance(cls_label, list):
+                        for i in range(len(lb)):
+                            if lb[i][0] in cls_label:
+                                new_lb.append(lb[i])
+                    lb = np.array(new_lb, dtype=np.float32)
+                
+            label = {
+                "im_file": img_path,
+                "shape": (h0, w0),
+                "cls": lb[:, 0:1],  # n, 1
+                "bboxes": lb[:, 1:],  # n, 4
+                "segments": [],
+                "keypoints": None,
+                "normalized": True,
+                "bbox_format": "xywh",
+            }
+        else:
+            raise ValueError("something's wrong")
+        
+        return label, im, (h0,w0)
+        
+    def update_labels_info(self, label):
+        """
+        Custom your label format here.
+
+        Note:
+            cls is not with bboxes now, classification and semantic segmentation need an independent cls label
+            Can also support classification and semantic segmentation by adding or removing dict keys there.
+        """
+        bboxes = label.pop("bboxes")
+        segments = label.pop("segments", [])
+        keypoints = label.pop("keypoints", None)
+        bbox_format = label.pop("bbox_format")
+        normalized = label.pop("normalized")
+
+        # NOTE: do NOT resample oriented boxes
+        segment_resamples = 100 if self.use_obb else 1000
+        if len(segments) > 0:
+            # make sure segments interpolate correctly if original length is greater than segment_resamples
+            max_len = max(len(s) for s in segments)
+            segment_resamples = (max_len + 1) if segment_resamples < max_len else segment_resamples
+            # list[np.array(segment_resamples, 2)] * num_samples
+            segments = np.stack(resample_segments(segments, n=segment_resamples), axis=0)
+        else:
+            segments = np.zeros((0, segment_resamples, 2), dtype=np.float32)
+        label["instances"] = Instances(bboxes, segments, keypoints, bbox_format=bbox_format, normalized=normalized)
+        return label
+    
+
+    def register_stream(self, datalist):
+        self.stream_data = []
+        for data in datalist:
+            try:
+                img_name = data['file_name']
+            except KeyError:
+                img_name = data['filepath']
+            
+            label, im, hw0 = self.get_data(img_name, cls_label=data['label'], image_dir = self.image_dir, label_dir = self.label_dir)
+            
+            label.pop("shape", None)  # shape is for rect, remove it
+            label["img"], label["ori_shape"], label["resized_shape"] = im, hw0, im.shape[:2]
+            label["ratio_pad"] = (
+                label["resized_shape"][0] / label["ori_shape"][0],
+                label["resized_shape"][1] / label["ori_shape"][1],
+            )  # for evaluation
+            
+            label = self.update_labels_info(label)
+            
+            self.stream_data.append(label)
     def add_new_class(self, cls_list, sample=None):
         self.cls_list = cls_list
         self.cls_count.append(0)
@@ -608,37 +757,7 @@ class MemoryDataset(Dataset):
         self.cls_dict = {self.cls_list[i]:i for i in range(len(self.cls_list))}
         self.cls_train_cnt = np.append(self.cls_train_cnt, 0)
 
-    def __getitem__(self, idx):
-        sample = dict()
-        if torch.is_tensor(idx):
-            idx = idx.value()
-        label = self.labels[idx]
-        image = self.images[idx]
-        if self.transform:
-            image = self.transform(image)
-        sample["image"] = image
-        sample["label"] = label
-        return sample
-
-    def register_stream(self, datalist):
-        self.stream_images = []
-        self.stream_labels = []
-        for data in datalist:
-            try:
-                img_name = data['file_name']
-            except KeyError:
-                img_name = data['filepath']
-            if self.data_dir is None:
-                img_path = os.path.join("dataset", self.dataset, img_name)
-            else:
-                img_path = os.path.join(self.data_dir, img_name)
-            if self.use_kornia:
-                self.stream_images.append(self.preprocess(PIL.Image.open(img_path).convert('RGB')))
-            elif self.transform_on_gpu:
-                self.stream_images.append(self.transform_cpu(PIL.Image.open(img_path).convert('RGB')))
-            else:
-                self.stream_images.append(PIL.Image.open(img_path).convert('RGB'))
-            self.stream_labels.append(self.cls_list.index(data['klass']))
+    
 
     def update_gss_score(self, score, idx=None):
         if idx is None:
@@ -690,544 +809,72 @@ class MemoryDataset(Dataset):
             self.cls_times[label] = time
         
 
-    def replace_sample(self, sample, idx=None, logit=None, attention_map=None, count=None, task=None, mode=None, online_iter=None):
-        self.cls_count[self.cls_dict[sample['klass']]] += 1
+    def replace_sample(self, sample, idx=None, logit=None, attention_map=None, count=None, task=None, mode=None, online_iter=None, images_dir=None, labels_dir=None):
+        # self.cls_count[self.cls_dict[sample['klass']]] += 1
+        label, im, hw0 = self.get_data(sample['file_name'], cls_label=sample['label'],
+                                       image_dir = images_dir if images_dir else self.image_dir, 
+                                       label_dir = labels_dir if labels_dir else self.label_dir)
         if idx is None:
-            self.cls_idx[self.cls_dict[sample['klass']]].append(len(self.images))
-            self.datalist.append(sample)
-            
-            # ER이면 Iteration만큼 이미 usage_cnt가 update 되어 있어야함
-            if mode == 'er':
-                if online_iter is not None:
-                    self.usage_cnt.append(online_iter)
-                else:
-                    self.usage_cnt.append(0)
-            else:
-                self.usage_cnt.append(0)
-                
-            self.sample_weight.append(1)
-            try:
-                img_name = sample['file_name']
-            except KeyError:
-                img_name = sample['filepath']
-            if self.data_dir is None:
-                img_path = os.path.join("dataset", self.dataset, img_name)
-            else:
-                img_path = os.path.join(self.data_dir, img_name)
-            img = PIL.Image.open(img_path).convert('RGB')
-            if self.use_kornia:
-                img = self.preprocess(img)
-            elif self.transform_on_gpu:
-                img = self.transform_cpu(img)
-            self.images.append(img)
-            self.labels.append(self.cls_dict[sample['klass']])
-            self.losses.append(0.1)
+            # self.cls_idx[self.cls_dict[sample['klass']]].append(len(self.images))
+            self.ims.append(im)
+            self.im_hw0.append(hw0)
+            self.im_hw.append(im.shape[:2])
+            self.labels.append(label)
+            self.buffer.append(len(self.labels)-1)
              
-            # for recent
-            # self.time_update(self.cls_dict[sample['klass']], sample['time'])
-
-            if count is not None:
-                self.counts.append(count)
-
-            if self.save_test == 'gpu':
-                self.device_img.append(self.test_transform(img).to(self.device).unsqueeze(0))
-            elif self.save_test == 'cpu':
-                self.device_img.append(self.test_transform(img).unsqueeze(0))
-            if self.keep_history:
-                if self.cls_count[self.cls_dict[sample['klass']]] == 1:
-                    self.others_loss_decrease = np.append(self.others_loss_decrease, 0)
-                else:
-                    self.others_loss_decrease = np.append(self.others_loss_decrease, np.mean(self.others_loss_decrease[self.cls_idx[self.cls_dict[sample['klass']]][:-1]]))
-
         else:
-            self.cls_count[self.labels[idx]] -= 1
-            self.cls_idx[self.labels[idx]].remove(idx)
-            self.datalist[idx] = sample
-            self.usage_cnt[idx] = 0
-            self.cls_idx[self.cls_dict[sample['klass']]].append(idx)
-            try:
-                img_name = sample['file_name']
-            except KeyError:
-                img_name = sample['filepath']
-            if self.data_dir is None:
-                img_path = os.path.join("dataset", self.dataset, img_name)
-            else:
-                img_path = os.path.join(self.data_dir, img_name)
-            img = PIL.Image.open(img_path).convert('RGB')
-            if self.use_kornia:
-                img = self.preprocess(img)
-            elif self.transform_on_gpu:
-                img = self.transform_cpu(img)
+            # self.cls_count[self.labels[idx]] -= 1
+            # self.cls_idx[self.labels[idx]].remove(idx)
+            # self.datalist[idx] = sample
+            # self.usage_cnt[idx] = 0
+            # self.cls_idx[self.cls_dict[sample['klass']]].append(idx)
 
             # for recent
             # self.time_update(self.cls_dict[sample['klass']], sample['time'])
                 
-            self.images[idx] = img
-            self.labels[idx] = self.cls_list.index(sample['klass'])
-            self.sample_weight[idx] = 1
-            self.losses[idx] = 0.1
-
-            if count is not None:
-                self.counts[idx] = count
-
-            if self.save_test == 'gpu':
-                self.device_img[idx] = self.test_transform(img).to(self.device).unsqueeze(0)
-            elif self.save_test == 'cpu':
-                self.device_img[idx] = self.test_transform(img).unsqueeze(0)
-            if self.keep_history:
-                if self.cls_count[self.cls_dict[sample['klass']]] == 1:
-                    self.others_loss_decrease[idx] = np.mean(self.others_loss_decrease)
-                else:
-                    self.others_loss_decrease[idx] = np.mean(self.others_loss_decrease[self.cls_idx[self.cls_dict[sample['klass']]][:-1]])
-
-    '''
-    def classwise_get_weight(self, weight_method="recent_important", batch_size):
-        weight = np.zeros(len(self.images))
-        weight = weight.astype('float64')
-        
-        batch = np.zeros(batch_size)
-        
-        cls_weight = []
-        
-        if weight_method == "recent_important":
-            print("self.cls_times", self.cls_times)
-            
-            # method 1) times 기반 class에 weight 주기
-            max_time = max(self.cls_times) + 0.2
-            for klass, klass_time in enumerate(self.cls_times):
-                klass_index = np.where(klass == np.array(self.labels))[0]
-                weight[klass_index] = (klass_time+0.2) / max_time #np.exp(-1*(klass_count/total_count))
-                cls_weight.append(np.exp((klass_time+0.2) / max_time))
-
-            cls_weight = F.softmax(torch.DoubleTensor(cls_weight), dim=0)
-            selected_place = random.choices(range(len(self.cls_times)), k=batch_size, weights=cls_weight) # klass가 몇개 select되는지 자리 배정
-            
-            for place in list(set(selected_place)):
-                place_index = np.where(place == selected_place)[0]
-                klass_index = np.where(place == np.array(self.labels))[0]
-                klass_selected_index = random.choices(klass_index, k=len(place_index))
-                for i, index in enumerate(place_index):
-                    batch[index] = klass_selected_index[i]
-                
-            #print("selected_place")
-            #print(selected_place)
-            
-
-            # method 2) times 기반 class별 buffer 공간 나누기
-            # then samplewise로 use_count 기반
-            
-        elif weight_method == "count_important":
-            total_count = sum(self.class_usage_cnt)
-            if total_count == 0:
-                total_count = 1
-            for klass, klass_count in enumerate(self.class_usage_cnt):
-                # 아직 많이 학습에 안쓰인 애들
-                klass_index = np.where(klass == np.array(self.labels))[0]
-                weight[klass_index] = np.exp(-1*(klass_count/total_count))
-                cls_weight.append(np.exp(-1*(klass_count/total_count)))
-
-        elif weight_method == "mixed":
-            total_count = sum(self.class_usage_cnt)
-            if total_count == 0:
-                total_count = 1
-            max_time = max(self.cls_times) + 0.5
-
-            for klass, klass_count in enumerate(self.class_usage_cnt):
-                # 아직 많이 학습에 안쓰인 애들
-                klass_time = self.cls_times[klass]
-                klass_index = np.where(klass == np.array(self.labels))[0]
-                weight[klass_index] = np.exp(-1*(klass_count/total_count))
-
-
-
-        if self.weight_option == "softmax" or "loss":
-            weight_tensor = torch.DoubleTensor(weight)
-            weight = F.softmax(weight_tensor, dim=0)
-            
-        elif self.weight_option == "weightsum":
-            weight = weight / sum(weight)
-
-        return weight
-    '''
+            self.ims[idx] = im
+            self.im_hw0[idx] = hw0
+            self.im_hw[idx] = im.shape[:2]
+            self.labels[idx] = label
     
-    def get_std(self):
-        class_std = np.std(self.class_usage_cnt)
-        sample_std = np.std(self.usage_cnt)
-        return class_std, sample_std
-    
-    
-    def classwise_get_weight(self, weight_method, batch_size):
-        weight = np.zeros(len(self.images))
-        weight = weight.astype('float64')
-        batch = np.zeros(batch_size)
-        cls_weight = []
-        
-        if weight_method == "recent_important":
-            
-            # method 1) times 기반 class에 weight 주기
-            max_time = max(self.cls_times) + 0.4
-            for klass, klass_time in enumerate(self.cls_times):
-                klass_index = np.where(klass == np.array(self.labels))[0]
-                weight[klass_index] = (klass_time+0.4) / max_time #np.exp(-1*(klass_count/total_count))
-                cls_weight.append(np.exp(((klass_time+0.4) / max_time)))
-
-            #print("selected_place")
-            #print(selected_place)
-
-            # method 2) times 기반 class별 buffer 공간 나누기
-            # then samplewise로 use_count 기반
-            
-        elif weight_method == "count_important":
-            
-            total_count = sum(self.class_usage_cnt)
-            if total_count == 0:
-                total_count = 1
-            for klass, klass_count in enumerate(self.class_usage_cnt):
-                # 아직 많이 학습에 안쓰인 애들
-                klass_index = np.where(klass == np.array(self.labels))[0]
-                weight[klass_index] = np.exp(-1*(klass_count/total_count))
-                cls_weight.append(np.exp(-1.5*(klass_count/total_count)))
-
-        elif weight_method == "equal_prob":
-            ##### for balanced random retrieval #####
-            equal_prob = 1/len(self.class_usage_cnt)
-            print("equal_prob", equal_prob)
-
-            for klass, klass_count in enumerate(self.class_usage_cnt):
-                cls_weight.append(equal_prob)
-        
-        if self.weight_option == "softmax" or "loss":
-            weight_tensor = torch.DoubleTensor(cls_weight)
-            cls_weight = F.softmax(weight_tensor, dim=0)
-            
-        elif self.weight_option == "weightsum":
-            cls_weight = cls_weight / sum(cls_weight)
-
-        return cls_weight
-
-    
-    def update_class_loss(self, indices, sample_loss):
-        cls_loss_dict = {}
-        
-        # class별로 loss 묶기
-        for i, index in enumerate(indices):
-            klass = self.labels[index]
-            
-            if klass in cls_loss_dict.keys():
-                cls_loss_dict[klass].append(sample_loss[i].item())
-            else:
-                cls_loss_dict[klass] = [sample_loss[i].item()]
-        
-        #self.previous_cls_loss = copy.deepcopy(self.cls_loss)
-            
-            
-        # self.cls_loss update
-        for klass in cls_loss_dict.keys():
-            klass_loss_list = cls_loss_dict[klass]
-            if len(klass_loss_list) == 1:
-                klass_loss = klass_loss_list[0]
-            else:
-                klass_loss = np.mean(klass_loss_list)
-            
-            if self.cls_loss[klass] is not None:
-                self.cls_loss[klass] = self.cls_loss[klass] * (1-self.weight_ema_ratio) + klass_loss * self.weight_ema_ratio
-            else:
-                self.cls_loss[klass] = klass_loss
-        
-        '''
-        if self.use_human_training:
-            self.transform_gpu.set_cls_magnitude(self.cls_loss, self.cls_count)
-            self.cls_magnitude = self.transform_gpu.get_cls_magnitude()
-        '''
-        
-    def get_cls_magniutude(self):
-        return self.transform_gpu.get_cls_magnitude()
-    
-    
-    def update_sample_loss(self, indices, sample_loss):
-        
-        '''
-        print("indices")
-        print(indices)
-        print("sample_loss")
-        print(sample_loss)
-        '''
-        for i, index in enumerate(indices):
-            #self.losses[index] = self.weight_ema_ratio * sample_loss[i].item()  + (1-self.weight_ema_ratio) * self.losses[index]
-            self.losses[index] = sample_loss[i].item()
-        
-        '''
-        print("losses")
-        print(np.array(self.losses)[indices])
-        '''
-    
-    def decrease_weight(self, cls_idx):
-        self.cls_weight[cls_idx] *= self.cls_weight_decay
-
-    def samplewise_get_weight(self, weight_method, indices = None):
-        
-        if indices is None:
-            weight = np.zeros(len(self.images))
-            weight = weight.astype('float64')
-            for i, count in enumerate(self.usage_cnt):
-                weight[i] = np.exp(-1*count)
-        else:
-            total_count = max(np.array(self.usage_cnt)[indices])
-            if total_count == 0:
-                total_count = 1
-            weight = np.zeros_like(indices)
-            weight = weight.astype('float64')
-            for i, index in enumerate(indices):
-                count = self.usage_cnt[index]
-                weight[i] = np.exp(-3*((count**2)/total_count))
-                
-        #print("!count")
-        #print(np.array(self.usage_cnt)[indices])
-        #print("!weight", weight)
-        
-        if self.weight_option == "softmax" or self.weight_option == "loss":
-            weight_tensor = torch.DoubleTensor(weight)
-            weight = F.softmax(weight_tensor, dim=0)
-            
-        elif self.weight_option == "weightsum":
-            weight = np.array(weight) / sum(weight)
-        
-        else:
-            print("??")
-        #print("!weight", weight)
-        '''
-        elif self.weight_option == "loss":
-            
-            losses = np.array(self.losses)
-            losses = 1 / losses
-            losses = torch.DoubleTensor(losses)
-            weight = F.softmax(losses, dim=0)
-            
-            print("usage_count")
-            print(self.usage_cnt)
-            print("loss")
-            print(self.losses)
-            print("weight")
-            print(weight)
-        '''
-        return weight
-    
-    def get_similarity_weight(self, sim_matrix):
-        weight = torch.Tensor(self.usage_cnt)
-        #total_count = sum(self.class_usage_cnt)
-        
-        for my_klass, my_klass_count in enumerate(self.class_usage_cnt):
-            klass_index = np.where(my_klass == np.array(self.labels))[0]
-            x = 0
-            for other_klass, other_class_count in enumerate(self.class_usage_cnt):
-                if my_klass > other_klass:
-                    continue
-                min_klass = min(my_klass, other_klass)
-                max_klass = max(my_klass, other_klass)
-                #print("sim_matrix")
-                #print(sim_matrix)
-                #print("min_klass", min_klass, "max_class", max_klass)
-                if sim_matrix[min_klass][max_klass] is None:
-                    continue
-                x += (sim_matrix[min_klass][max_klass] * other_class_count)
-            weight[klass_index] += x 
-
-        total_count = sum(weight)
-        '''
-        print("self.labels")
-        print(self.labels)
-        print("weight")
-        print(weight)
-        '''
-        weight = torch.exp(-(weight/total_count)*self.T).double()
-        weight = F.softmax(weight, dim=0)
-        return weight
-            
     @torch.no_grad()
-    def get_batch(self, batch_size, stream_batch_size=0, use_weight=None, transform=None, recent_ratio=None, exp_weight=False, weight_method=None, class_loss=None, similarity_matrix = None):
-
+    def get_batch(self, batch_size, stream_batch_size=0, use_weight=None, transform=None, weight_method=None):
         assert batch_size >= stream_batch_size
-        stream_batch_size = min(stream_batch_size, len(self.stream_images))
-        batch_size = min(batch_size, stream_batch_size + len(self.images))
+        stream_batch_size = min(stream_batch_size, len(self.stream_data))
+        batch_size = min(batch_size, stream_batch_size + len(self.labels))
         memory_batch_size = batch_size - stream_batch_size
         
         if memory_batch_size > 0:
-            if use_weight == "classwise":
-                weight = np.zeros(memory_batch_size)
-                indices = np.zeros(memory_batch_size)
-                cls_weight = self.classwise_get_weight(weight_method, memory_batch_size)
-                
-                # class별로 구간을 나누고 각 klass에 해당하는 sample들을 채우기
-                selected_place = random.choices(range(len(self.cls_times)), k=memory_batch_size, weights=cls_weight) # klass가 몇개 select되는지 자리 배정
-
-                for place in list(set(selected_place)):
-                    place_index = np.where(place == np.array(selected_place))[0]
-                    klass_index = np.where(place == np.array(self.labels))[0]
-
-                    if len(place_index) > len(klass_index): # 자리가 더 많은 것
-                        klass_selected_index = random.sample(list(klass_index), len(klass_index))
-                        klass_selected_index.extend(random.sample(range(len(self.images)), len(place_index) - len(klass_index)))
-                        
-                        # 이때는 loss_balancing 하면 안됨
-                        # (자기한테 배정된 자리도 다 못채우므로)
-                        
-                    else: # sample이 더 많은 것
-                        sample_weight = self.samplewise_get_weight(weight_method=weight_method, indices=klass_index)
-                        klass_selected_index = np.random.choice(list(klass_index), size=len(place_index), replace=False, p=sample_weight)
-                        
-                        '''
-                        # sample_count 기반
-                        sample_weight = self.samplewise_get_weight(weight_method=weight_method, indices=klass_index)
-                        print("self.class_usage_cnt[place]", self.class_usage_cnt[place], "self.klass_warmup", self.klass_warmup)
-                        if 2*len(place_index) <= len(klass_index) and data_mix[place] and self.class_usage_cnt[place] > self.klass_warmup:
-                            total_selected_index = np.random.choice(list(klass_index), size=2*len(place_index), replace=False, p=sample_weight)
-                            klass_selected_index = total_selected_index[:len(place_index)]
-                        else:
-                            klass_selected_index = np.random.choice(list(klass_index), size=len(place_index), replace=False, p=sample_weight)
-                        '''
-                    
-                    for i, index in enumerate(place_index):
-                        indices[index] = klass_selected_index[i]
-                        weight[index] = cls_weight[place]
-
-                    # cls 기반 같은 class끼리 cutmix
-                    # 너무 적게 뽑히는 class의 경우 걔로 인해서 좌지우지 될 수 있기 때문
-
-                indices = indices.astype('int64')
-                
-            elif use_weight == "samplewise":
-                weight = self.samplewise_get_weight(weight_method=weight_method)
-                indices = np.random.choice(range(len(self.images)), size=memory_batch_size, replace=False, p=weight)
+            # if use_weight == "samplewise":
+            #     weight = self.samplewise_get_weight(weight_method=weight_method)
+            #     indices = np.random.choice(range(len(self.images)), size=memory_batch_size, replace=False, p=weight)
             
-            elif use_weight == "similarity":
-                if similarity_matrix is None:
-                    # balanced random retrieval
-                    weight = np.zeros(memory_batch_size)
-                    indices = np.zeros(memory_batch_size)
-                    cls_weight = self.classwise_get_weight("equal_prob", memory_batch_size)
-
-                    # class별로 구간을 나누고 각 klass에 해당하는 sample들을 채우기
-                    selected_place = random.choices(range(len(self.cls_times)), k=memory_batch_size, weights=cls_weight) # klass가 몇개 select되는지 자리 배정
-
-                    for place in list(set(selected_place)):
-                        place_index = np.where(place == np.array(selected_place))[0]
-                        klass_index = np.where(place == np.array(self.labels))[0]
-
-                        if len(place_index) > len(klass_index): # 자리가 더 많은 것
-                            klass_selected_index = random.sample(list(klass_index), len(klass_index))
-                            klass_selected_index.extend(random.sample(range(len(self.images)), len(place_index) - len(klass_index)))
-                            
-                        else: # sample이 더 많은 것
-                            sample_weight = self.samplewise_get_weight(weight_method=weight_method, indices=klass_index)
-                            klass_selected_index = np.random.choice(list(klass_index), size=len(place_index), replace=False, p=sample_weight)
-                        
-                        for i, index in enumerate(place_index):
-                            indices[index] = klass_selected_index[i]
-                            weight[index] = cls_weight[place]
-
-                    indices = indices.astype('int64')
-
-                else:
-                    print("similarity_matrix")
-                    weight = self.get_similarity_weight(similarity_matrix)
-                    indices = np.random.choice(range(len(self.images)), size=memory_batch_size, replace=False, p=weight)
-            
-            else:
-                indices = np.random.choice(range(len(self.images)), size=memory_batch_size, replace=False)
+            # else:
+            indices = np.random.choice(range(len(self.labels)), size=memory_batch_size, replace=False)
         
             # batch 내 select된 class를 count에 반영
-            for i in indices:
-                self.class_usage_cnt[self.labels[i]] += 1
+            # for i in indices:
+            #     self.class_usage_cnt[self.labels[i]] += 1
         
-            
         if stream_batch_size > 0:
-            if len(self.stream_images) > stream_batch_size:
-                stream_indices = np.random.choice(range(len(self.stream_images)), size=stream_batch_size, replace=False)
+            if len(self.stream_data) > stream_batch_size:
+                stream_indices = np.random.choice(range(len(self.stream_data)), size=stream_batch_size, replace=False)
             else:
-                stream_indices = np.arange(len(self.stream_images))
+                stream_indices = np.arange(len(self.stream_data))
             
             # ER에서는 계속해서 학습에 사용되므로
+            # for i in stream_indices:
+            #     self.class_usage_cnt[self.stream_labels[i]] += 1
+        data = []
+        if stream_batch_size > 0:
             for i in stream_indices:
-                self.class_usage_cnt[self.stream_labels[i]] += 1
+                data.append(self.transforms(self.stream_data[i]))
 
-        data = dict()
-        lam = None
-        images = []
-        labels = []
-        use_cnt = []
-        logits = []
-        counter = []
-        d = []
-        task_ids = []
+        if memory_batch_size > 0:
+            for i in indices:
+                data.append(self.__getitem__(i))
         
-        mean_usage = np.mean(self.usage_cnt)
-        if self.use_kornia:
-            # images
-            if stream_batch_size > 0:
-                for i in stream_indices:
-                    images.append(self.stream_images[i])
-                    labels.append(self.stream_labels[i])
-                    
-            if memory_batch_size > 0:
-                for i in indices:
-                    images.append(self.images[i])
-                    labels.append(self.labels[i])
-                    use_cnt.append(self.usage_cnt[i])
-                    self.usage_cnt[i] += 1
-
-            images = torch.stack(images).to(self.device)
-            # for curriculum learning
-            images = self.transform_gpu(images, labels)
-
-        else:
-            if stream_batch_size > 0:
-                for i in stream_indices:
-                    if transform is None:
-                        if self.transform_on_gpu:
-                            images.append(self.transform_gpu(self.stream_images[i].to(self.device)))
-                        else:
-                            images.append(self.transform(self.stream_images[i]))
-                    else:
-                        if self.transform_on_gpu:
-                            images.append(transform(self.stream_images[i].to(self.device)))
-                        else:
-                            images.append(transform(self.stream_images[i]))
-                    labels.append(self.stream_labels[i])
-
-            if memory_batch_size > 0:
-                for i in indices:
-                    if transform is None:
-                        if self.transform_on_gpu:
-                            images.append(self.transform_gpu(self.images[i].to(self.device)))
-                        else:
-                            images.append(self.transform(self.images[i]))
-                    else:
-                        if self.transform_on_gpu:
-                            images.append(transform(self.images[i].to(self.device)))
-                        else:
-                            images.append(transform(self.images[i]))
-
-                    use_cnt.append(self.usage_cnt[i] / mean_usage)
-                    labels.append(self.labels[i])
-                    logits.append(self.logits[i])
-                    self.cls_train_cnt[self.labels[i]] += 1
-                    self.usage_cnt[i] += 1
-
-            images = torch.stack(images)
-        
-        #if use_weight=="classwise":
-        if use_weight is not None:
-            data['cls_weight'] = weight
-        data['counter'] = Counter(labels)
-        data['image'] = images
-        data['label'] = torch.LongTensor(labels)
-        data['usage'] = torch.Tensor(use_cnt)
-
-        if self.keep_history:
-            self.previous_idx = np.append(self.previous_idx, indices)
-
-        return data
-
+        return collate_fn(data)
 
     def update_loss_history(self, loss, prev_loss, ema_ratio=0.90, dropped_idx=None):
         if dropped_idx is None:

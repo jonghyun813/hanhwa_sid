@@ -14,14 +14,12 @@ from methods.baseline import BASELINE
 logger = logging.getLogger()
 
 
-def select_method(args, criterion, device, train_transform, test_transform, n_classes):
+def select_method(args, criterion, n_classes, device):
     kwargs = vars(args)
     if args.mode == "er":
         method = ER(
             criterion=criterion,
             device=device,
-            train_transform=train_transform,
-            test_transform=test_transform,
             n_classes=n_classes,
             **kwargs,
         )
@@ -120,8 +118,6 @@ def select_method(args, criterion, device, train_transform, test_transform, n_cl
         method = SDP(
             criterion=criterion,
             device=device,
-            train_transform=train_transform,
-            test_transform=test_transform,
             n_classes=n_classes,
             **kwargs,
         )

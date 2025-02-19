@@ -1,14 +1,9 @@
-import torch_optimizer
-from easydict import EasyDict as edict
 from torch import optim
 import torch
 import pandas as pd
-from models import mnist, cifar, imagenet
 from torch.utils.data import DataLoader
-from onedrivedownloader import download as dn
 from torch.optim import SGD
 import numpy as np
-import timm
 import copy
 from utils.data_loader import get_train_datalist, ImageDataset, StreamDataset, MemoryDataset, cutmix_data, get_statistics, get_test_datalist
 import torch.nn.functional as F
@@ -45,51 +40,6 @@ class CrossEntropyLossMaybeSmooth(nn.CrossEntropyLoss):
         return loss
 
 
-class DataAugmentation(nn.Module):
-
-    def __init__(self, inp_size, mean, std) -> None:
-        super().__init__()
-        self.randaugmentation = Kornia_Randaugment()
-        self.inp_size = inp_size
-        self.mean = mean
-        self.std = std
-
-        additional_aug = self.randaugmentation.form_transforms()
-        self.transforms = nn.Sequential(
-            K.Resize(size = (inp_size,inp_size)),
-            K.RandomCrop(size = (inp_size,inp_size)),
-            K.RandomHorizontalFlip(p=1.0),
-            *additional_aug,
-            K.Normalize(mean, std)
-            )
-        #self.cutmix = K.RandomCutMix(p=0.5)
-
-    def set_cls_magnitude(self, option, current_cls_loss, class_count):
-        self.randaugmentation.set_cls_magnitude(option, current_cls_loss, class_count)
-
-    def get_cls_magnitude(self):
-        return self.randaugmentation.get_cls_magnitude()
-
-    def get_cls_num_ops(self):
-        return self.randaugmentation.get_cls_num_ops()
-
-    @torch.no_grad()  # disable gradients for effiency
-    def forward(self, x: Tensor, labels=None) -> Tensor:
-        #if labels is None or len(self.randaugmentation.cls_num_ops) == 0:
-        additional_aug = self.randaugmentation.form_transforms()
-        self.transforms = nn.Sequential(
-            K.Resize(size = (self.inp_size, self.inp_size)),
-            K.RandomCrop(size = (self.inp_size, self.inp_size)),
-            K.RandomHorizontalFlip(p=1.0),
-            *additional_aug,
-            K.Normalize(self.mean, self.std)
-            )
-        #print("transform")
-        #print(self.transforms)
-        x_out = self.transforms(x)  # BxCxHxW
-
-        return x_out
-
 def kl_loss(logits_stu, logits_tea, temperature=4.0):
     """
     Args:
@@ -108,79 +58,44 @@ def kl_loss(logits_stu, logits_tea, temperature=4.0):
     ).sum(1).mean(0) * (temperature ** 2)
     return loss_kd
 
-def get_transform(dataset, transform_list, gpu_transform, use_kornia=True):
-    mean, std, n_classes, inp_size, _ = get_statistics(dataset=dataset)
-    if use_kornia:
-        train_transform = DataAugmentation(inp_size, mean, std)
+def select_optimizer(name, model, lr=0.01, momentum=0.9, decay=1e-5,):
+    # if hasattr(model, 'fc'):
+    #     fc_name = 'fc'
+    # elif hasattr(model, 'head'):
+    #     fc_name = 'head'
+    g = [], [], []  # optimizer parameter groups
+    bn = tuple(v for k, v in nn.__dict__.items() if "Norm" in k)  # normalization layers, i.e. BatchNorm2d()
+    for module_name, module in model.named_modules():
+        for param_name, param in module.named_parameters(recurse=False):
+            fullname = f"{module_name}.{param_name}" if module_name else param_name
+            if "bias" in fullname:  # bias (no decay)
+                g[2].append(param)
+            elif isinstance(module, bn):  # weight (no decay)
+                g[1].append(param)
+            else:  # weight (with decay)
+                g[0].append(param)
+
+    optimizers = {"Adam", "Adamax", "AdamW", "NAdam", "RAdam", "RMSProp", "SGD", "auto"}
+    name = {x.lower(): x for x in optimizers}.get(name.lower())
+    if name in {"Adam", "Adamax", "AdamW", "NAdam", "RAdam"}:
+        optimizer = getattr(optim, name, optim.Adam)(g[2], lr=lr, betas=(momentum, 0.999), weight_decay=0.0)
+    elif name == "RMSProp":
+        optimizer = optim.RMSprop(g[2], lr=lr, momentum=momentum)
+    elif name == "SGD":
+        optimizer = optim.SGD(g[2], lr=lr, momentum=momentum, nesterov=True)
     else:
-        train_transform = []
-        if "cutout" in transform_list:
-            train_transform.append(Cutout(size=16))
-            if gpu_transform:
-                gpu_transform = False
-                print("cutout not supported on GPU!")
-        if "randaug" in transform_list:
-            train_transform.append(transforms.RandAugment())
-            
-        if "autoaug" in transform_list:
-            if hasattr(transform_list, 'AutoAugment'):
-                if 'cifar' in dataset:
-                    train_transform.append(transforms.AutoAugment(transforms.AutoAugmentPolicy('cifar10')))
-                elif 'imagenet' in dataset:
-                    train_transform.append(transforms.AutoAugment(transforms.AutoAugmentPolicy('imagenet')))
-            else:
-                train_transform.append(select_autoaugment(dataset))
-                gpu_transform = False
-        if "trivaug" in transform_list:
-            train_transform.append(transforms.TrivialAugmentWide())
-        if gpu_transform:
-            train_transform = transforms.Compose([
-                transforms.RandomCrop(inp_size, padding=4),
-                transforms.RandomHorizontalFlip(),
-                *train_transform,
-                transforms.ConvertImageDtype(torch.float32),
-                transforms.Normalize(mean, std),
-            ])
-        else:
-            train_transform = transforms.Compose(
-                [
-                    transforms.Resize((inp_size, inp_size)),
-                    transforms.RandomCrop(inp_size, padding=4),
-                    transforms.RandomHorizontalFlip(),
-                    *train_transform,
-                    transforms.ToTensor(),
-                    transforms.Normalize(mean, std),
-                ]
-            )
-    print(f"Using train-transforms {train_transform}")
-
-    test_transform = transforms.Compose(
-        [
-            transforms.Resize((inp_size, inp_size)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean, std),
-        ]
-    )
-    return train_transform, test_transform
-
-def select_optimizer(opt_name, lr, model):
-    if hasattr(model, 'fc'):
-        fc_name = 'fc'
-    elif hasattr(model, 'head'):
-        fc_name = 'head'
-    if "adam" in opt_name:
-        params = [param for name, param in model.named_parameters() if fc_name not in name]
-        opt = optim.Adam(params, lr=lr, weight_decay=0)
-    elif "sgd" in opt_name:
-        params = [param for name, param in model.named_parameters() if fc_name not in name]
-        opt = optim.SGD(
-            params, lr=lr, momentum=0.9, nesterov=True, weight_decay=1e-4
+        raise NotImplementedError(
+            f"Optimizer '{name}' not found in list of available optimizers {optimizers}. "
+            "Request support for addition optimizers at https://github.com/ultralytics/ultralytics."
         )
-    else:
-        raise NotImplementedError("Please select the opt_name [adam, sgd]")
-    if 'freeze_fc' not in opt_name:
-        opt.add_param_group({'params': getattr(model, fc_name).parameters()})
-    return opt
+
+    optimizer.add_param_group({"params": g[0], "weight_decay": decay})  # add g0 with weight_decay
+    optimizer.add_param_group({"params": g[1], "weight_decay": 0.0})  # add g1 (BatchNorm2d weights)
+
+    return optimizer
+    # if 'freeze_fc' not in opt_name:
+    #     opt.add_param_group({'params': getattr(model, fc_name).parameters()})
+    # return opt
 
 def select_scheduler(sched_name, opt, hparam=None):
     if "exp" in sched_name:
@@ -202,159 +117,6 @@ def select_scheduler(sched_name, opt, hparam=None):
     return scheduler
 
 
-
-def get_ckpt_remote_url(pre_dataset):
-    if pre_dataset == "cifar100":
-        return '<iframe src="https://onedrive.live.com/embed?cid=D3924A2D106E0039&resid=D3924A2D106E0039%21108&authkey=AFsCv4BR-bmTUII" width="98" height="120" frameborder="0" scrolling="no"></iframe>',"rs18_cifar100.pth"
-
-    elif pre_dataset == "tinyimgR":
-        return '<iframe src="https://onedrive.live.com/embed?cid=D3924A2D106E0039&resid=D3924A2D106E0039%21106&authkey=AKTxp5LFQJ9z9Ok" width="98" height="120" frameborder="0" scrolling="no"></iframe>', "erace_pret_on_tinyr.pth"
-
-    elif pre_dataset == "imagenet":
-        return '<iframe src="https://onedrive.live.com/embed?cid=D3924A2D106E0039&resid=D3924A2D106E0039%21107&authkey=ADHhbeg9cUoqJ0M" width="98" height="120" frameborder="0" scrolling="no"></iframe>',"rs50_imagenet_full.pth"
-
-    else:
-        raise ValueError("Unknown auxiliary dataset")
-
-
-def load_initial_checkpoint(pre_dataset, model, device, load_cp_path = None):
-    url, ckpt_name = get_ckpt_remote_url(pre_dataset)
-    load_cp_path = load_cp_path if load_cp_path is not None else './checkpoints/'
-    print("Downloading checkpoint file...")
-    dn(url, load_cp_path)
-    print(f"Downloaded in: {load_cp}")
-    net = load_cp(load_cp_path, model, device, moco=True)
-    print("Loaded!")
-    return net
-
-def generate_initial_checkpoint(net, pre_dataset, pre_epochs, num_aux_classes, device, opt_args):
-    aux_dset, aux_test_dset = get_aux_dataset()
-    net.fc = torch.nn.Linear(net.fc.in_features, num_aux_classes).to(device)
-    net.train()
-    opt = SGD(net.parameters(), lr=opt_args["lr"], weight_decay=opt_args["optim_wd"], momentum=opt_args["optim_mom"])
-    sched = None
-    if self.args.pre_dataset.startswith('cub'):
-        sched = torch.optim.lr_scheduler.MultiStepLR(
-            opt, milestones=[80, 150, 250], gamma=0.5)
-    elif 'tinyimg' in self.args.pre_dataset.lower():
-        sched = torch.optim.lr_scheduler.MultiStepLR(
-            opt, milestones=[20, 30, 40, 45], gamma=0.5)
-
-    for e in range(pre_epochs):
-        for i, (x, y, _) in tqdm(enumerate(aux_dl), desc='Pre-training epoch {}'.format(e), leave=False, total=len(aux_dl)):
-            y = y.long()
-            opt.zero_grad()
-            x = x.to(self.device)
-            y = y.to(self.device)
-            aux_out = net(x)
-            aux_loss = loss(aux_out, y)
-            aux_loss.backward()
-            opt.step()
-
-        if sched is not None:
-            sched.step()
-        if e % 5 == 4:
-            print(e, f"{self.mini_eval()*100:.2f}%")
-    from datetime import datetime
-    # savwe the model
-    now = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    modelpath = "my_checkpoint" + '_' + now + '.pth'
-    torch.save(net.state_dict(), modelpath)
-    print(modelpath)
-
-def load_cp(cp_path, net, device, moco=False) -> None:
-    """
-    Load pretrain checkpoint, optionally ignores and rebuilds final classifier.
-
-    :param cp_path: path to checkpoint
-    :param new_classes: ignore and rebuild classifier with size `new_classes`
-    :param moco: if True, allow load checkpoint for Moco pretraining
-    """
-    print("net")
-    print([name for name, _ in net.named_parameters()])
-    s = torch.load(cp_path, map_location=device)
-    print("s keys", s.keys())
-    '''
-    if 'state_dict' in s:  # loading moco checkpoint
-        if not moco:
-            raise Exception(
-                'ERROR: Trying to load a Moco checkpoint without setting moco=True')
-        s = {k.replace('encoder_q.', ''): i for k,
-             i in s['state_dict'].items() if 'encoder_q' in k}
-    '''
-
-    #if not ignore_classifier: # online CL이므로 fc out-dim을 1부터 시작
-    net.fc = torch.nn.Linear(
-        net.fc.in_features, 1).to(device) # online이므로 num_aux_classes => 1
-
-    for k in list(s):
-        if 'fc' in k:
-            s.pop(k)
-    for k in list(s):
-        if 'net' in k:
-            s[k[4:]] = s.pop(k)
-    for k in list(s):
-        if 'wrappee.' in k:
-            s[k.replace('wrappee.', '')] = s.pop(k)
-    for k in list(s):
-        if '_features' in k:
-            s.pop(k)
-
-    try:
-        net.load_state_dict(s)
-    except:
-        _, unm = net.load_state_dict(s, strict=False)
-        print("unm")
-        print(unm)
-        '''
-        if new_classes is not None or ignore_classifier:
-            assert all(['classifier' in k for k in unm]
-                       ), f"Some of the keys not loaded where not classifier keys: {unm}"
-        else:
-            assert unm is None, f"Missing keys: {unm}"
-        '''
-
-    return net
-'''
-def partial_distill_loss(model, net_partial_features: list, pret_partial_features: list,
-                         targets, teacher_forcing: list = None, extern_attention_maps: list = None):
-
-    assert len(net_partial_features) == len(
-        pret_partial_features), f"{len(net_partial_features)} - {len(pret_partial_features)}"
-
-    if teacher_forcing is None or extern_attention_maps is None:
-        assert teacher_forcing is None
-        assert extern_attention_maps is None
-
-    loss = 0
-    attention_maps = []
-
-    for i, (net_feat, pret_feat) in enumerate(zip(net_partial_features, pret_partial_features)):
-        assert net_feat.shape == pret_feat.shape, f"{net_feat.shape} - {pret_feat.shape}"
-
-        adapter = getattr(
-            model, f"adapter_{i+1}")
-
-        pret_feat = pret_feat.detach()
-
-        if teacher_forcing is None:
-            curr_teacher_forcing = torch.zeros(
-                len(net_feat,)).bool().to(self.device)
-            curr_ext_attention_map = torch.ones(
-                (len(net_feat), adapter.c)).to(self.device)
-        else:
-            curr_teacher_forcing = teacher_forcing
-            curr_ext_attention_map = torch.stack(
-                [b[i] for b in extern_attention_maps], dim=0).float()
-
-        adapt_loss, adapt_attention = adapter(net_feat, pret_feat, targets,
-                                              teacher_forcing=curr_teacher_forcing, attention_map=curr_ext_attention_map)
-
-        loss += adapt_loss
-        attention_maps.append(adapt_attention.detach().cpu().clone().data)
-
-    return loss / (i + 1), attention_maps
-'''
 def get_data_loader(opt_dict, dataset, pre_train=False):
     if pre_train:
         batch_size = 128
@@ -707,51 +469,6 @@ def sorted_cand_ind(eval_df, cand_df, n_eval, n_cand):
     # Sort candidate set indices based on distance
     sorted_cand_ind_ = distance_matrix.argsort(1)
     return sorted_cand_ind_
-
-
-#### For x_der ###
-def normalize(x, mean, std):
-    assert len(x.shape) == 4
-    return (x - torch.tensor(mean).unsqueeze(0).unsqueeze(2).unsqueeze(3).to(x.device)) \
-        / torch.tensor(std).unsqueeze(0).unsqueeze(2).unsqueeze(3).to(x.device)
-
-
-def random_flip(x):
-    assert len(x.shape) == 4
-    mask = torch.rand(x.shape[0]) < 0.5
-    x[mask] = x[mask].flip(3)
-    return x
-
-
-def random_grayscale(x, prob=0.2):
-    assert len(x.shape) == 4
-    mask = torch.rand(x.shape[0]) < prob
-    x[mask] = (x[mask] * torch.tensor([[0.299, 0.587, 0.114]]).unsqueeze(2).unsqueeze(2).to(x.device)).sum(1, keepdim=True).repeat_interleave(3, 1)
-    return x
-
-
-class strong_aug():
-    def __init__(self, size, mean, std):
-        self.transform = transforms.Compose([
-            # transforms.ToPILImage(),
-            transforms.RandomResizedCrop(size=size, scale=(0.2, 1.)),
-            transforms.RandomApply([
-                transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)
-            ], p=0.8),
-            # transforms.ToTensor()
-        ])
-        self.mean = mean
-        self.std = std
-
-    def __call__(self, x):
-        flip = random_flip(x)
-        tmp = torch.stack(
-                [self.transform(a) for a in flip]
-            )
-        tmp2 = random_grayscale(
-            tmp)
-        y = normalize(tmp2, self.mean, self.std)
-        return y
 
 
 class SupConLoss(nn.Module):

@@ -12,11 +12,12 @@ from ultralytics import RTDETR
 model = YOLO("yolov8s.pt")
 print(model.ckpt['train_args'])
 train_args = model.ckpt['train_args']
-model = YOLO('./configuration/models/yolov8_nc10.yaml')
+model = YOLO('yolov8s.yaml')
 
 # RTDETR
 # model = RTDETR("rtdetr-l.pt")
 # print(model.ckpt['train_args'])
+# breakpoint()
 # train_args = model.ckpt['train_args']
 # model = RTDETR('rtdetr-l.yaml')
 
@@ -27,8 +28,8 @@ model = YOLO('./configuration/models/yolov8_nc10.yaml')
 # model = YOLO('yolo11l.yaml')
 
 # breakpoint()
-train_args['data'] = './configuration/datasets/VOC_10.yaml'
-train_args['device']= "0"
+train_args['data'] = './configuration/datasets/VOC.yaml'
+train_args['device']= "6"
 # Train the model
 train_results = model.train(**train_args)
 

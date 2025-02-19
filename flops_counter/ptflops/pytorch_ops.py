@@ -15,7 +15,7 @@ def empty_flops_counter_hook(module, input, output):
 
 
 def upsample_flops_counter_hook(module, input, output):
-    print("upsample input shape", input.shape, "output shape", output.shape)
+    print("upsample output shape", output.shape)
     output_size = output[0]
     batch_size = output_size.shape[0]
     output_elements_count = batch_size

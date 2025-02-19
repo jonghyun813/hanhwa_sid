@@ -14,7 +14,6 @@ from torch.utils.tensorboard import SummaryWriter
 from torchvision import transforms
 
 from methods.er_baseline import ER
-from models.layers import StatTrack
 from utils.data_loader import ImageDataset, StreamDataset, MemoryDataset, cutmix_data, get_statistics, \
     DistillationMemory, cutmix_feature, get_test_datalist
 from utils.train_utils import select_optimizer
