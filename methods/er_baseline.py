@@ -196,7 +196,6 @@ class ER:
             data = self.memory.get_batch(batch_size, stream_batch_size)
             
             self.optimizer.zero_grad()
-            self.model.model.train()
 
             loss, loss_item = self.model_forward(data)
 
@@ -214,7 +213,6 @@ class ER:
             
             # self.total_flops += (batch_size * (self.forward_flops + self.backward_flops))
             # print("self.total_flops", self.total_flops)
-
         return total_loss / iterations
 
     
@@ -276,12 +274,13 @@ class ER:
             f"ETA {datetime.timedelta(seconds=int((time.time() - self.start_time) * (self.total_samples-sample_num) / sample_num))}"
         )
 
-    def report_test(self, sample_num, avg_loss, avg_acc, online_acc):
-        self.writer.add_scalar(f"test/loss", avg_loss, sample_num)
+    def report_test(self, sample_num, avg_acc, classwise_acc):
+        # self.writer.add_scalar(f"test/loss", avg_loss, sample_num)
         self.writer.add_scalar(f"test/acc", avg_acc, sample_num)
-        self.writer.add_scalar(f"test/online_acc", online_acc, sample_num)
+        # self.writer.add_scalar(f"test/classwise_acc", classwise_acc, sample_num)
         logger.info(
-            f"Test | Sample # {sample_num} | test_loss {avg_loss:.4f} | test_acc {avg_acc:.4f} | online_acc {online_acc:.4f} "
+            f"Test | Sample # {sample_num} | test_acc {avg_acc:.4f} | \n"
+            f"classwise mAP50 [{'|'.join([str(round(cls_acc,3)) for cls_acc in classwise_acc])}]"
         )
 
     def report_val(self, sample_num, avg_loss, avg_acc, class_loss, class_magnitude):
@@ -326,12 +325,21 @@ class ER:
         pass
 
     def online_evaluate(self, sample_num, cls_dict, cls_addition, data_time):
-        results = self.model.val(data="configuration/datasets/VOC.yaml")
+        model = copy.deepcopy(self.model)
+        model.model.eval()
+        results = model.val(data="configuration/datasets/VOC.yaml")
         # self.exposed_classes
-        breakpoint()
+        # get class-wise results
+        maps = []
+        for i in range(len(self.exposed_classes)):
+            maps.append(results.box.class_result(i)[2])
+        eval_dict = {
+            "avg_mAP50": sum(maps)/len(maps),
+            "classwise_mAP50": maps
+        }
         # online_acc = self.calculate_online_acc(eval_dict["cls_acc"], data_time, cls_dict, cls_addition)
         # eval_dict["online_acc"] = online_acc
-        # self.report_test(sample_num, eval_dict["avg_loss"], eval_dict["avg_acc"], eval_dict["online_acc"])
+        self.report_test(sample_num, eval_dict["avg_mAP50"], eval_dict["classwise_mAP50"])
 
         # # if sample_num >= self.f_next_time:
         #     # self.get_forgetting(sample_num, test_list, cls_dict, batch_size, n_worker)
@@ -342,7 +350,7 @@ class ER:
         
         # self.save_std_pickle()
         
-        # return eval_dict
+        return eval_dict
 
     def get_forgetting(self, sample_num, test_list, cls_dict, batch_size, n_worker):
         test_df = pd.DataFrame(test_list)

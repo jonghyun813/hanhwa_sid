@@ -88,7 +88,7 @@ def main():
         train_datalist = train_datalist[:5000]
 
     #train_datalist = train_datalist[:5000] + train_datalist[10000:15000]
-
+    print(f"total train stream: {len(train_datalist)}")
     for i, data in enumerate(train_datalist):
 
         # explicit task boundary for twf
@@ -114,16 +114,15 @@ def main():
         ''' 
         if samples_cnt % args.eval_period == 0:
             eval_dict = method.online_evaluate(samples_cnt, cls_dict, cls_addition, data["time"])
-            eval_results["test_acc"].append(eval_dict['avg_acc'])
-            eval_results["percls_acc"].append(eval_dict['cls_acc'])
-            eval_results["online_acc"].append(eval_dict['online_acc'])
+            eval_results["test_acc"].append(eval_dict['avg_mAP50'])
+            eval_results["classwise_acc"].append(eval_dict['classwise_mAP50'])
             eval_results["data_cnt"].append(samples_cnt)
-            if method.f_calculated:
-                eval_results["forgetting_acc"].append(eval_dict['cls_acc'])
+            # if method.f_calculated:
+            #     eval_results["forgetting_acc"].append(eval_dict['cls_acc'])
     if eval_results["data_cnt"][-1] != samples_cnt:
         eval_dict = method.online_evaluate(samples_cnt, cls_dict, cls_addition, data["time"])
 
-    A_last = eval_dict['avg_acc']
+    A_last = eval_dict['avg_mAP50']
 
     if args.mode == 'gdumb':
         eval_results = method.evaluate_all(args.memory_epoch, cls_dict, cls_addition)
@@ -132,22 +131,21 @@ def main():
     np.save(f'results/{args.dataset}/{args.note}/seed_{args.rnd_seed}_eval_time.npy', eval_results['data_cnt'])
 
     # Accuracy (A)
-    A_auc = np.mean(eval_results["test_acc"])
-    A_online = np.mean(eval_results["online_acc"])
+    A_auc = np.mean(eval_results["avg_mAP50"])
+    # A_online = np.mean(eval_results["online_acc"])
 
-    cls_acc = np.array(eval_results["forgetting_acc"])
-    acc_diff = []
-    for j in range(n_classes):
-        if np.max(cls_acc[:-1, j]) > 0:
-            acc_diff.append(np.max(cls_acc[:-1, j]) - cls_acc[-1, j])
-    F_last = np.mean(acc_diff)
-    IF_avg = np.mean(method.forgetting[1:])
-    KG_avg = np.mean(method.knowledge_gain[1:])
-    Total_flops = method.get_total_flops()
+    # cls_acc = np.array(eval_results["forgetting_acc"])
+    # acc_diff = []
+    # for j in range(n_classes):
+    #     if np.max(cls_acc[:-1, j]) > 0:
+    #         acc_diff.append(np.max(cls_acc[:-1, j]) - cls_acc[-1, j])
+    # F_last = np.mean(acc_diff)
+    # IF_avg = np.mean(method.forgetting[1:])
+    # KG_avg = np.mean(method.knowledge_gain[1:])
+    # Total_flops = method.get_total_flops()
 
     logger.info(f"======== Summary =======")
-    logger.info(f"A_auc {A_auc} | A_online {A_online} | A_last {A_last} | F_last {F_last} | IF_avg {IF_avg} | KG_avg {KG_avg} | Total_flops {Total_flops}")
-    # logger.info(f"A_auc {A_auc} | A_online {A_online} | A_last {A_last} | F_last {F_last}")
+    logger.info(f"A_auc {A_auc} |  A_last {A_last} ") #| Total_flops {Total_flops}")
 
 if __name__ == "__main__":
     main()
