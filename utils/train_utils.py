@@ -171,8 +171,25 @@ from ultralytics import YOLO
 
 def select_model(dataset):
     if dataset == 'VOC_10_10':
-        model = YOLO('configuration/models/yolov8_nc20.yaml')
-        model = model.load('pretrained_weights/yolov8_VOC_10.pt')
+        model = YOLO('configuration/models/yolov8_nc20.yaml').load('pretrained_weights/yolov8_VOC_10.pt')
+        model2 = YOLO('configuration/models/yolov8_nc10.yaml').load('pretrained_weights/yolov8_VOC_10.pt')
+        
+        prev_weight1 = copy.deepcopy(model2.model.model[22].cv3[0][2].weight.data)
+        prev_bias1 = copy.deepcopy(model2.model.model[22].cv3[0][2].bias.data)
+        prev_weight2 = copy.deepcopy(model2.model.model[22].cv3[1][2].weight.data)
+        prev_bias2 = copy.deepcopy(model2.model.model[22].cv3[1][2].bias.data)
+        prev_weight3 = copy.deepcopy(model2.model.model[22].cv3[2][2].weight.data)
+        prev_bias3 = copy.deepcopy(model2.model.model[22].cv3[2][2].bias.data)
+        del model2
+        
+        with torch.no_grad():
+            model.model.model[22].cv3[0][2].weight[:10] = prev_weight1
+            model.model.model[22].cv3[0][2].bias[:10] = prev_bias1
+            model.model.model[22].cv3[1][2].weight[:10] = prev_weight2
+            model.model.model[22].cv3[1][2].bias[:10] = prev_bias2
+            model.model.model[22].cv3[2][2].weight[:10] = prev_weight3
+            model.model.model[22].cv3[2][2].bias[:10] = prev_bias3
+        
     return model
 
 ##### for ASER #####
