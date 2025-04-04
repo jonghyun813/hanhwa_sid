@@ -312,10 +312,8 @@ class BaseModel(torch.nn.Module):
 
         # print("DEBUG 6")
 
-        # code modify start
         if distillation and is_teacher:
             return preds
-        
 
         if teacher_output: # distillation after pretraining
             from ultralytics.utils.loss import v8DetectionLoss_distillation
@@ -323,10 +321,6 @@ class BaseModel(torch.nn.Module):
 
             return self.criterion(preds, batch, teacher_output, teacher_learned_class)
 
-
-
-        # code modify end
-        
         # return self.criterion(preds, batch)
         return self.criterion(preds, batch, distillation) # code modify, original loss during pretraining
 
