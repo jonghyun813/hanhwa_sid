@@ -578,7 +578,7 @@ class MemoryDataset(Dataset):
         self.image_dir = image_dir
         self.label_dir = label_dir
         
-        self.augment = True
+        self.augment = False
         self.rect = False
         self.imgsz = self.args.imgsz
         self.use_segments = False
@@ -588,6 +588,29 @@ class MemoryDataset(Dataset):
         self.build_initial_buffer()
         
         self.transforms = self.build_transforms(self.args)
+
+    def my_sampler(self, data):
+
+
+        try:
+            img_name = data['file_name']
+        except KeyError:
+            img_name = data['filepath']
+        
+        label, im, hw0 = self.get_data(img_name, cls_label=data['label'], image_dir = self.image_dir, label_dir = self.label_dir)
+        
+        label.pop("shape", None)  # shape is for rect, remove it
+        label["img"], label["ori_shape"], label["resized_shape"] = im, hw0, im.shape[:2]
+        label["ratio_pad"] = (
+            label["resized_shape"][0] / label["ori_shape"][0],
+            label["resized_shape"][1] / label["ori_shape"][1],
+        )  # for evaluation
+
+        label = self.update_labels_info(label)
+        label = self.transforms(copy.deepcopy(label))
+        label = collate_fn([label])
+
+        return label
         
     def build_initial_buffer(self):
         images_dir, labels_dir = get_pretrained_statistics(self.dataset)

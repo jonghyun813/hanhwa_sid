@@ -130,3 +130,9 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+
+tensorboard
+logs
+results
+pretrained_weights

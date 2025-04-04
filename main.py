@@ -87,8 +87,11 @@ def main():
         random.shuffle(train_datalist)
         train_datalist = train_datalist[:5000]
 
+    # _ = method.online_evaluate(samples_cnt, cls_dict, cls_addition, 0)
+
     #train_datalist = train_datalist[:5000] + train_datalist[10000:15000]
     print(f"total train stream: {len(train_datalist)}")
+
     for i, data in enumerate(train_datalist):
 
         # explicit task boundary for twf
@@ -97,7 +100,17 @@ def main():
             task_id += 1
 
         samples_cnt += 1
-        method.online_step(data, samples_cnt, args.n_worker)
+        # method.online_step(data, samples_cnt, args.n_worker)
+        if samples_cnt == 1:
+            import copy
+            teacher_model = copy.deepcopy(method.model.model)
+            teacher_learned_class = method.num_learned_class
+        if samples_cnt % 100 == 0:
+            print("UPDATING TEACHER MODEL")
+            teacher_model = copy.deepcopy(method.model.model)
+            teacher_learned_class = method.num_learned_class
+        method.online_step(data, samples_cnt, args.n_worker, teacher_model, teacher_learned_class)
+
         '''
         if args.max_validation_interval is not None and args.min_validation_interval is not None:
             if samples_cnt % method.get_validation_interval() == 0:

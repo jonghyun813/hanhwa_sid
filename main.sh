@@ -13,8 +13,8 @@ SEEDS="1"
 
 if [ "$DATASET" == "VOC_10_10" ]; then
     MEM_SIZE=2000 ONLINE_ITER=1
-    MODEL_NAME="resnet18" EVAL_PERIOD=100
-    BATCHSIZE=16; LR=0.01 OPT_NAME="SGD" SCHED_NAME="default" IMP_UPDATE_PERIOD=1
+    MODEL_NAME="resnet18" EVAL_PERIOD=10
+    BATCHSIZE=1; LR=1e-4 OPT_NAME="SGD" SCHED_NAME="default" IMP_UPDATE_PERIOD=1
 
 elif [ "$DATASET" == "cifar100" ]; then
     MEM_SIZE=2000 ONLINE_ITER=3
@@ -38,7 +38,7 @@ fi
 
 for RND_SEED in $SEEDS
 do
-    CUDA_VISIBLE_DEVICES=7 python main.py --mode $MODE --n_worker 8 \
+    python main.py --mode $MODE --n_worker 8 \
     --dataset $DATASET \
     --sigma $SIGMA --repeat $REPEAT --init_cls $INIT_CLS\
     --rnd_seed $RND_SEED \

@@ -267,7 +267,7 @@ class ER:
             self.optimizer.zero_grad()
 
             # print(new_data['cls'])
-            loss, loss_item = self.model_forward(new_data, teacher_model, teacher_learned_class)
+            loss, loss_item = self.model_forward(data, teacher_model)
             # loss, loss_item = self.model_forward(new_data, teacher_model)
 
             self.use_amp = False
@@ -301,7 +301,7 @@ class ER:
         
     #     return loss, loss_items
 
-    def model_forward(self, batch, teacher_model, teacher_learned_class):
+    def model_forward(self, batch, teacher_model):
 
 
         # print(batch["img"])
@@ -309,8 +309,10 @@ class ER:
         # batch["img"].requires_grad = True
 
         teacher_output = None
+        distillation = False
         distillation = True
         teacher_output = teacher_model(batch, distillation=distillation, is_teacher=True)
+
 
 
         # print("DEBUG 0")
@@ -319,10 +321,10 @@ class ER:
             # with torch.cuda.amp.autocast():
             with torch.amp.autocast('cuda'):
                 batch = self.preprocess_batch(batch)
-                loss, loss_items = self.model.model(batch, distillation=distillation, is_teacher=False, teacher_output=teacher_output, teacher_learned_class=teacher_learned_class)
+                loss, loss_items = self.model.model(batch, distillation=distillation, is_teacher=False, teacher_output=teacher_output) # code modify
         else:
             batch = self.preprocess_batch(batch)
-            loss, loss_items = self.model.model(batch, distillation=distillation, is_teacher=False, teacher_output=teacher_output, teacher_learned_class=teacher_learned_class)
+            loss, loss_items = self.model.model(batch, distillation=distillation, is_teacher=False, teacher_output=teacher_output)
         
 
         # if self.use_amp:
@@ -375,12 +377,12 @@ class ER:
             self.writer.add_scalars(f"train/cka", cka_dict, sample_num)
             #self.writer.add_scalar(f"train/fc_cka", train_fc_cka, sample_num)
 
-        logger.info(
-            f"Train | Sample # {sample_num} | train_loss {train_loss:.4f} | "
-            f"lr {self.optimizer.param_groups[0]['lr']:.6f} | "
-            f"running_time {datetime.timedelta(seconds=int(time.time() - self.start_time))} | "
-            f"ETA {datetime.timedelta(seconds=int((time.time() - self.start_time) * (self.total_samples-sample_num) / sample_num))}"
-        )
+        # logger.info(
+        #     f"Train | Sample # {sample_num} | train_loss {train_loss:.4f} | "
+        #     f"lr {self.optimizer.param_groups[0]['lr']:.6f} | "
+        #     f"running_time {datetime.timedelta(seconds=int(time.time() - self.start_time))} | "
+        #     f"ETA {datetime.timedelta(seconds=int((time.time() - self.start_time) * (self.total_samples-sample_num) / sample_num))}"
+        # )
 
     def report_test(self, sample_num, avg_acc, classwise_acc):
         # self.writer.add_scalar(f"test/loss", avg_loss, sample_num)
